@@ -1,0 +1,97 @@
+name: Build test APK
+
+# 仅用于在 fork 上构建带修复的测试包，不参与上游发版流程。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/queue-stale-switch
+
+concurrency:
+  group: build-test-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      APP_VARIANT: production
+      ABI_FILTERS: arm64-v8a,x86_64
+      SENTRY_DISABLE_AUTO_UPLOAD: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # versionCode 用 git rev-list --count HEAD 计算，需要完整历史
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prebuild Android project
+        working-directory: apps/mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Build release APK
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Sign APK
+        working-directory: apps/mobile/android
+        run: |
+          set -euo pipefail
+
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          APK_DIR="app/build/outputs/apk/release"
+          SRC="$APK_DIR/app-release-unsigned.apk"
+          OUT="bbplayer-test-arm64-x86_64.apk"
+
+          ls -lh "$APK_DIR"
+
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/test.jks" \
+            -alias bbplayer \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass bbplayer -keypass bbplayer \
+            -dname "CN=BBPlayer CI Test, O=BBPlayer, C=CN"
+
+          "$BT/zipalign" -p -f 4 "$SRC" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/test.jks" \
+            --ks-pass pass:bbplayer \
+            --key-pass pass:bbplayer \
+            --out "$GITHUB_WORKSPACE/$OUT" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$GITHUB_WORKSPACE/$OUT"
+
+          sha256sum "$GITHUB_WORKSPACE/$OUT" | tee "$GITHUB_WORKSPACE/$OUT.sha256"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbplayer-test-apk
+          path: |
+            bbplayer-test-arm64-x86_64.apk
+            bbplayer-test-arm64-x86_64.apk.sha256
+          if-no-files-found: error
